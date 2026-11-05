@@ -1,0 +1,272 @@
+#+TITLE: chatwire
+
+One client interface over several instant messaging services.
+
+=chatwire= connects to a chat service as an ordinary account, the way
+any desktop client does, and gives a Rust program two things:
+
+- every event that account sees, in a vocabulary that does not depend
+  on the service;
+- the means to write back: post, reply, edit, react, join, leave.
+
+It is a brick, not a program. It decides nothing, answers nobody by
+itself, and holds no opinion about what deserves a reaction. That
+belongs to whatever uses it.
+
+Nothing is installed on the chat server. The library is a client, so
+it needs an account and no administrator rights.
+
+* Status
+
+| Service     | State                                     |
+|-------------+-------------------------------------------|
+| Matrix      | implemented, against Synapse              |
+| Rocket.Chat | planned, behind the same interface        |
+
+* Using it
+
+#+begin_src toml
+[dependencies]
+chatwire = { git = "https://github.com/0k/chatwire" }
+#+end_src
+
+Default features build the Matrix backend. To take only the
+vocabulary, and no backend:
+
+#+begin_src toml
+chatwire = { git = "https://github.com/0k/chatwire", default-features = false }
+#+end_src
+
+Pin a =rev= or =tag= for reproducible builds.
+
+** Reading
+
+#+begin_src rust
+use chatwire::{Client, Config, Event};
+
+let config = Config::load(std::path::Path::new("config.yml"))?;
+let client = chatwire::matrix::connect(&config, None).await?;
+let mut events = client.subscribe();
+
+while let Some(event) = events.recv().await {
+    if let Event::Message(message) = event {
+        println!("{}: {}", message.sender.label(), message.body);
+    }
+}
+#+end_src
+
+** Writing
+
+#+begin_src rust
+use chatwire::Outgoing;
+
+client.send(room, Outgoing::text("hello")).await?;
+client.send(room, Outgoing::text("on it").reply_to(message_id)).await?;
+client.send(room, Outgoing::text("build finished").as_notice()).await?;
+
+client.react(room, message_id, "👍").await?;
+client.edit(room, my_message_id, "corrected text").await?;
+client.remove(room, my_message_id).await?;
+client.typing(room, true).await?;
+client.mark_read(room, message_id).await?;
+#+end_src
+
+** Choosing what to receive
+
+Everything, by default:
+
+#+begin_src rust
+let mut events = client.subscribe();
+#+end_src
+
+Or a chosen set:
+
+#+begin_src rust
+use chatwire::{EventKind, Subscription};
+
+let mut events = client.subscribe_to(
+    Subscription::only(&[EventKind::Message, EventKind::Reaction]),
+);
+
+let mut events = client.subscribe_to(
+    Subscription::except(&[EventKind::Typing, EventKind::Receipt]),
+);
+#+end_src
+
+Several subscribers can read at once, each with its own subscription.
+
+* Configuration
+
+Read from YAML with =Config::load=, or built in Rust.
+
+#+begin_src yaml
+service: matrix
+server: https://matrix.example.org
+account: "@someone:example.org"
+store-path: ./store
+device-name: chatwire
+#+end_src
+
+| Key           | Required | Default      | Meaning                                                  |
+|---------------+----------+--------------+----------------------------------------------------------|
+| =service=     | yes      | —            | =matrix= or =rocket-chat=                                |
+| =server=      | yes      | —            | Base URL, =http= or =https=                              |
+| =account=     | yes      | —            | For Matrix, a full id such as =@someone:example.org=     |
+| =store-path=  | no       | =./store=    | Where sessions and encryption keys live                  |
+| =device-name= | no       | =chatwire=   | Name shown in the account's device list                  |
+
+Unknown keys are refused rather than ignored, so a typo is reported
+instead of silently doing nothing. Keys are dash-cased.
+
+** The password is never in the configuration
+
+Pass it once, the first time:
+
+#+begin_src rust
+use chatwire::matrix::Credentials;
+
+let credentials = Credentials {
+    account: config.account.clone(),
+    password: ask_the_user()?,
+};
+let client = chatwire::matrix::connect(&config, Some(credentials)).await?;
+#+end_src
+
+After that the saved session is enough, and =None= suffices. Ask
+=chatwire::matrix::has_saved_session(&config)= to know which case you
+are in.
+
+** The store
+
+Each account gets its own directory, named after it:
+=./store/someone_example.org=. Two accounts therefore never collide, and
+changing the account in the configuration means a fresh login rather
+than a confusing refusal.
+
+Directories are created readable by their owner only, and so are the
+session files inside them.
+
+A store belonging to another account is refused with a message naming
+the directory to remove. Losing the store means logging in again, and
+for Matrix losing the encryption keys that device had received.
+
+* Events
+
+Every event carries the conversation it happened in, except
+=connection=.
+
+| Event                | Carries                                                        |
+|----------------------+----------------------------------------------------------------|
+| =message=            | id, conversation, sender, direction, body, replies-to, time    |
+| =message-edited=     | id, conversation, sender, direction, new body, time            |
+| =message-removed=    | id of the removed message, conversation, who removed it, time  |
+| =reaction=           | message id, conversation, sender, the reaction, time           |
+| =membership-changed= | conversation, participant, =invited= / =joined= / =left=, time |
+| =typing=             | conversation, who is currently typing                          |
+| =receipt=            | conversation, participant, message read up to, time            |
+| =connection=         | =connected= / =lost= / =restored=                              |
+| =unsupported=        | the service's own event name, conversation when there is one   |
+
+=unsupported= exists so that a gap in this vocabulary is visible
+rather than silent: the service said something the library cannot yet
+express, and says so.
+
+** Both directions
+
+Messages sent by the connected account are delivered too, marked
+=direction: outgoing=, including when sent from another client or
+another device. They are not noise: knowing that you already answered
+is what stops a program answering again.
+
+** Bodies
+
+| Body             | Meaning                                                |
+|------------------+--------------------------------------------------------|
+| =text=           | text, as the sender typed it                           |
+| =media=          | an attachment: the service's type name, and a filename |
+| =undecryptable=  | an encrypted message this device holds no key for      |
+
+=undecryptable= is reported rather than dropped, so a program can tell
+"nothing was said" from "something was said that I cannot read".
+
+** What the Matrix backend reports today
+
+=message= (including undecryptable ones), =message-removed=,
+=membership-changed= (invitations), =typing=, =connection=.
+
+=message-edited=, =reaction= and =receipt= are part of the vocabulary
+and not yet emitted by this backend. Ask
+=chatwire::matrix::reported_kinds()= at runtime rather than assuming.
+
+* Handing events to another program
+
+=Envelope= turns any event into JSON, named =chat.<service>.<kind>=:
+
+#+begin_src rust
+let envelope = chatwire::Envelope::new(client.service(), &event)?;
+println!("{}", envelope.to_json()?);
+#+end_src
+
+#+begin_src json
+{
+  "directory": "chatwire",
+  "payload": {
+    "type": "chat.matrix.message",
+    "properties": {
+      "event": "message",
+      "id": "$abc",
+      "conversation": {"id": "!room:example.org", "name": "project",
+                       "encrypted": false, "direct": false},
+      "sender": {"id": "@alice:example.org", "name": "Alice"},
+      "direction": "incoming",
+      "body": {"kind": "text", "text": "hello"},
+      "replies_to": null,
+      "timestamp_ms": 1700000000000
+    }
+  }
+}
+#+end_src
+
+This is the shape vigil-watch dispatches on, so a hook placed in
+=hooks/chat.matrix.message/= receives it on standard input. The
+library produces the envelope and nothing more: delivering it is the
+caller's business, which keeps =chatwire= a chat client rather than a
+vigil-watch component.
+
+* Encryption
+
+For Matrix, the library is a client like any other: it has its own
+device and its own keys. Controlling the server does not grant access
+to end-to-end encrypted rooms.
+
+A new device therefore reports =undecryptable= for encrypted rooms
+until it is verified from an existing session. Messages sent after
+that verification are readable.
+
+* The console example
+
+=watch= connects, lists the conversations, and prints everything until
+Ctrl-C. It never writes.
+
+#+begin_src sh
+cargo run --example watch
+cargo run --example watch -- --envelopes   # print the JSON instead
+#+end_src
+
+It asks for the password on the first run. With no terminal available,
+it reads =CHATWIRE_PASSWORD= from the environment.
+
+An account taking part in no conversation makes it exit with an
+explanation instead of waiting silently: a watcher with nothing to
+watch is indistinguishable from a broken one.
+
+* Adding a service
+
+A backend provides a constructor and implements =Client=. It
+translates the service into the vocabulary above and never adds to it:
+anything it cannot express is =unsupported=, and any operation the
+service lacks returns =Error::Unsupported= rather than failing
+quietly.
+
+The Matrix backend is the worked example, in =src/matrix/=, where
+=translate.rs= holds the pure conversions and is tested on its own.
