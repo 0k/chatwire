@@ -152,6 +152,26 @@ pub trait Client: Send + Sync {
     /// Leave a conversation.
     async fn leave(&self, conversation: &str) -> Result<()>;
 
+    /// Whether this device already holds the account's encryption
+    /// secrets, so it reads end-to-end encrypted messages as the user's
+    /// other devices do.  Services without end-to-end encryption say yes.
+    async fn recovered(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Give this device the account's encryption secrets, from the
+    /// recovery key (or passphrase) the user's other clients set up.
+    ///
+    /// Once done, the secrets live in the local store: the device signs
+    /// itself as one of the user's devices and fetches missing message
+    /// keys from the key backup.  The key itself is not kept.
+    async fn recover(&self, _recovery_key: &str) -> Result<()> {
+        Err(crate::error::Error::Unsupported {
+            service: self.service().to_string(),
+            operation: "recover encryption keys".to_owned(),
+        })
+    }
+
     /// Stop receiving and release the connection.
     async fn shutdown(self: Box<Self>);
 }

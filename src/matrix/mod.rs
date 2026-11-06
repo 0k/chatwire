@@ -73,6 +73,13 @@ pub async fn connect(config: &Config, credentials: Option<Credentials>) -> Resul
     let inner = SdkClient::builder()
         .homeserver_url(&config.server)
         .sqlite_store(&store_path, None)
+        // Once the recovery key has been given (see `recover`), a message
+        // this device holds no key for is decrypted from the key backup.
+        .with_encryption_settings(matrix_sdk::encryption::EncryptionSettings {
+            backup_download_strategy:
+                matrix_sdk::encryption::BackupDownloadStrategy::AfterDecryptionFailure,
+            ..Default::default()
+        })
         .build()
         .await
         .map_err(|source| {
@@ -262,6 +269,24 @@ impl Client for MatrixClient {
             .await
             .map_err(|source| Error::Send(format!("cannot leave {conversation}: {source}")))?;
         Ok(())
+    }
+
+    async fn recovered(&self) -> Result<bool> {
+        self.inner
+            .encryption()
+            .wait_for_e2ee_initialization_tasks()
+            .await;
+        Ok(self.inner.encryption().recovery().state()
+            == matrix_sdk::encryption::recovery::RecoveryState::Enabled)
+    }
+
+    async fn recover(&self, recovery_key: &str) -> Result<()> {
+        self.inner
+            .encryption()
+            .recovery()
+            .recover(recovery_key)
+            .await
+            .map_err(|source| Error::Login(format!("cannot recover the encryption keys: {source}")))
     }
 
     async fn shutdown(self: Box<Self>) {
